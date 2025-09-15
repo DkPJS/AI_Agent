@@ -1,0 +1,113 @@
+version: '3.8'
+
+services:
+  # app:
+  #   image: python:3.10-slim
+  #   command: bash -c "pip install -r requirements.txt python-multipart && 
+  #            python -m spacy download en_core_web_sm && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - .:/app
+  #     - ./static:/app/static
+  #   working_dir: /app
+  #   environment:
+  #     - HOST=0.0.0.0
+  #     - PORT=8000
+  #     - DATABASE_URL=sqlite:///./rag_chatbot.db
+  #     - NEO4J_URI=bolt://neo4j:7687
+  #     - NEO4J_USERNAME=neo4j
+  #     - NEO4J_PASSWORD=password
+  #     - WEAVIATE_URL=http://weaviate:8080
+  #     - LLM_API_URL=http://ollama:11434/api/generate
+  #     - EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  #     - ENABLE_WORD_VECTORS=False
+  #   depends_on:
+  #     - neo4j
+  #     - weaviate
+  #     - ollama
+  #     - transformers
+
+  neo4j:
+    image: neo4j:5.11.0
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_dbms_allow__upgrade: "true"
+    volumes:
+      - neo4j_data:/data
+
+  weaviate:
+    image: semitechnologies/weaviate:1.25.3
+    ports:
+      - "${WEAVIATE_PORT_8080:-8080}:8080"
+      - "${WEAVIATE_PORT_50051:-50051}:50051"
+    environment:
+      QUERY_DEFAULTS_LIMIT: "${WEAVIATE_QUERY_DEFAULTS_LIMIT:-25}"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "${WEAVIATE_AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED:-true}"
+      PERSISTENCE_DATA_PATH: "${WEAVIATE_PERSISTENCE_DATA_PATH:-/var/lib/weaviate}"
+      ENABLE_MODULES: "${WEAVIATE_ENABLE_MODULES:-}"
+      DEFAULT_VECTORIZER_MODULE: "${WEAVIATE_DEFAULT_VECTORIZER_MODULE:-none}"
+      TRANSFORMERS_INFERENCE_API: "${WEAVIATE_TRANSFORMERS_INFERENCE_API:-http://transformers:8080}"
+      CLUSTER_HOSTNAME: "${WEAVIATE_CLUSTER_HOSTNAME:-}"
+      CLUSTER_ENABLED: "false"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    restart: always
+    depends_on:
+      - transformers
+
+  transformers:
+    image: semitechnologies/transformers-inference:sentence-transformers-paraphrase-multilingual-MiniLM-L12-v2
+    container_name: transformers
+    ports:
+      - "${TRANSFORMERS_PORT_8080:-8090}:8080"
+    restart: always
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - ENABLE_CUDA=true
+      - CUDA_VISIBLE_DEVICES=0
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "${OLLAMA_PORT_11434:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: always
+    command: serve
+    environment:
+      - OLLAMA_MODELS=/root/.ollama/models
+      - OLLAMA_DEBUG=${OLLAMA_DEBUG:-false}
+      - NVIDIA_VISIBLE_DEVICES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # 모델 다운로드를 위한 별도 서비스
+  ollama-setup:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    command: ["pull", "llama3"]
+    depends_on:
+      - ollama
+    restart: "no"  # 한 번만 실행
+
+volumes:
+  neo4j_data:
+  weaviate_data:
+  ollama_data:
