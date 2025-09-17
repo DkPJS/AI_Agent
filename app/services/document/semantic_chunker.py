@@ -25,13 +25,15 @@ class SemanticChunker:
         self.config = config or ChunkingConfig()
         self.text_splitter = KoreanTextSplitter()
         self.pattern_matcher = PatternMatcher()
+        # 동적 임계값으로 시작
+        self.adaptive_threshold = self.config.similarity_threshold
         self.similarity_calculator = SimilarityCalculator(
-            similarity_threshold=self.config.similarity_threshold
+            similarity_threshold=self.adaptive_threshold
         )
 
     def chunk_document(self, text: str, document_type: str = "general") -> List[Dict[str, Any]]:
         """
-        문서를 의미 기반으로 청킹
+        적응형 의미 기반 문서 청킹
 
         Args:
             text: 입력 텍스트
@@ -48,11 +50,21 @@ class SemanticChunker:
         if len(sentences) <= 3:
             return self._create_single_chunk(text, ChunkingMethod.SHORT)
 
-        # 2. 문서 유형별 청킹 전략 적용
+        # 2. 문서 특성 분석 및 임계값 조정
+        doc_characteristics = self._analyze_document_characteristics(text, sentences)
+        optimized_threshold = self._calculate_optimal_threshold(doc_characteristics, document_type)
+
+        # 3. 임계값 업데이트
+        self._update_similarity_threshold(optimized_threshold)
+
+        # 4. 문서 유형별 청킹 전략 적용
         doc_type_enum = self._get_document_type_enum(document_type)
         chunks = self._apply_chunking_strategy(sentences, doc_type_enum)
 
-        # 3. 메타데이터 추가 및 반환
+        # 5. 청킹 품질 평가 및 필요시 재조정
+        chunks = self._evaluate_and_improve_chunks(chunks, doc_characteristics)
+
+        # 6. 메타데이터 추가 및 반환
         return self._enrich_chunks_with_metadata(chunks, doc_type_enum)
 
     def _is_valid_text(self, text: str) -> bool:
@@ -137,4 +149,171 @@ class SemanticChunker:
             chunks.append(' '.join(current_chunk))
 
         return chunks
+
+    def _analyze_document_characteristics(self, text: str, sentences: List[str]) -> Dict[str, Any]:
+        """문서 특성 분석"""
+        characteristics = {}
+
+        # 텍스트 길이 및 복잡도
+        characteristics["total_length"] = len(text)
+        characteristics["sentence_count"] = len(sentences)
+        characteristics["avg_sentence_length"] = sum(len(s) for s in sentences) / len(sentences) if sentences else 0
+
+        # 구조화 정도
+        import re
+        structured_patterns = len(re.findall(r'^\d+\.|\n\d+\.|\n-|제\d+조|제\d+항', text))
+        characteristics["structure_density"] = structured_patterns / len(sentences) if sentences else 0
+
+        # 정보 밀도
+        korean_chars = len(re.findall(r'[가-힣]', text))
+        numbers = len(re.findall(r'\d+', text))
+        characteristics["info_density"] = (korean_chars + numbers * 2) / len(text) if text else 0
+
+        # 문장 유사성 분산도 (문서의 일관성 측정)
+        if len(sentences) >= 5:
+            try:
+                # 샘플 문장들의 유사도 계산
+                sample_sentences = sentences[::max(1, len(sentences)//10)][:10]
+                similarities = []
+                for i in range(len(sample_sentences)-1):
+                    for j in range(i+1, len(sample_sentences)):
+                        # 간단한 어휘 유사도 계산
+                        words1 = set(sample_sentences[i].split())
+                        words2 = set(sample_sentences[j].split())
+                        if words1 and words2:
+                            similarity = len(words1.intersection(words2)) / len(words1.union(words2))
+                            similarities.append(similarity)
+
+                characteristics["coherence_variance"] = np.var(similarities) if similarities else 0.5
+            except:
+                characteristics["coherence_variance"] = 0.5
+        else:
+            characteristics["coherence_variance"] = 0.3
+
+        return characteristics
+
+    def _calculate_optimal_threshold(self, characteristics: Dict[str, Any], document_type: str) -> float:
+        """문서 특성 기반 최적 임계값 계산"""
+        base_threshold = self.config.similarity_threshold
+
+        # 문서 유형별 기본 조정
+        type_adjustments = {
+            "general": 0.0,
+            "report": -0.05,    # 보고서는 구조가 있어 임계값 낮춤
+            "manual": -0.1,     # 매뉴얼은 단계별로 나누어야 함
+            "contract": -0.03   # 계약서는 조항별 분리
+        }
+
+        adjusted_threshold = base_threshold + type_adjustments.get(document_type, 0.0)
+
+        # 구조화 정도에 따른 조정
+        structure_density = characteristics.get("structure_density", 0)
+        if structure_density > 0.3:  # 구조화된 문서
+            adjusted_threshold -= 0.08
+        elif structure_density > 0.1:
+            adjusted_threshold -= 0.04
+
+        # 정보 밀도에 따른 조정
+        info_density = characteristics.get("info_density", 0.5)
+        if info_density > 0.8:  # 정보 밀도가 높으면 더 세밀하게 분할
+            adjusted_threshold -= 0.05
+        elif info_density < 0.3:  # 정보 밀도가 낮으면 더 크게 분할
+            adjusted_threshold += 0.05
+
+        # 일관성에 따른 조정
+        coherence_variance = characteristics.get("coherence_variance", 0.5)
+        if coherence_variance > 0.6:  # 일관성이 낮으면 더 세밀하게
+            adjusted_threshold -= 0.03
+        elif coherence_variance < 0.2:  # 일관성이 높으면 더 크게
+            adjusted_threshold += 0.03
+
+        # 임계값 범위 제한
+        final_threshold = max(0.3, min(0.9, adjusted_threshold))
+
+        logging.info(f"임계값 최적화: {base_threshold:.3f} → {final_threshold:.3f} "
+                    f"(구조: {structure_density:.3f}, 밀도: {info_density:.3f}, 일관성분산: {coherence_variance:.3f})")
+
+        return final_threshold
+
+    def _update_similarity_threshold(self, new_threshold: float):
+        """유사도 임계값 업데이트"""
+        self.adaptive_threshold = new_threshold
+        self.similarity_calculator.similarity_threshold = new_threshold
+
+    def _evaluate_and_improve_chunks(self, chunks: List[str], characteristics: Dict[str, Any]) -> List[str]:
+        """청킹 품질 평가 및 개선"""
+        if not chunks:
+            return chunks
+
+        # 청크 품질 지표 계산
+        quality_metrics = self._calculate_chunk_quality_metrics(chunks)
+
+        # 품질이 낮으면 재조정
+        if quality_metrics["overall_quality"] < 0.6:
+            logging.info(f"청킹 품질 낮음 ({quality_metrics['overall_quality']:.3f}), 재조정 수행")
+            improved_chunks = self._improve_chunk_quality(chunks, quality_metrics, characteristics)
+            return improved_chunks
+
+        return chunks
+
+    def _calculate_chunk_quality_metrics(self, chunks: List[str]) -> Dict[str, float]:
+        """청크 품질 지표 계산"""
+        if not chunks:
+            return {"overall_quality": 0.0}
+
+        metrics = {}
+
+        # 크기 일관성
+        chunk_lengths = [len(chunk) for chunk in chunks]
+        length_variance = np.var(chunk_lengths) / (np.mean(chunk_lengths) ** 2) if chunk_lengths else 1.0
+        metrics["size_consistency"] = max(0.0, 1.0 - length_variance)
+
+        # 적정 크기 비율
+        optimal_size_count = sum(1 for length in chunk_lengths
+                               if self.config.min_chunk_size <= length <= self.config.max_chunk_size)
+        metrics["size_appropriateness"] = optimal_size_count / len(chunks) if chunks else 0.0
+
+        # 내용 완성도 (문장 끝으로 끝나는 비율)
+        complete_chunks = sum(1 for chunk in chunks if chunk.strip().endswith(('.', '다', '음', '됨')))
+        metrics["completeness"] = complete_chunks / len(chunks) if chunks else 0.0
+
+        # 전체 품질 점수
+        metrics["overall_quality"] = (
+            metrics["size_consistency"] * 0.3 +
+            metrics["size_appropriateness"] * 0.4 +
+            metrics["completeness"] * 0.3
+        )
+
+        return metrics
+
+    def _improve_chunk_quality(self, chunks: List[str], quality_metrics: Dict[str, float],
+                              characteristics: Dict[str, Any]) -> List[str]:
+        """청킹 품질 개선"""
+        # 크기가 너무 작은 청크들 병합
+        improved_chunks = []
+        current_chunk = ""
+
+        for chunk in chunks:
+            if len(current_chunk) + len(chunk) <= self.config.max_chunk_size:
+                current_chunk = current_chunk + " " + chunk if current_chunk else chunk
+            else:
+                if current_chunk:
+                    improved_chunks.append(current_chunk.strip())
+                current_chunk = chunk
+
+        if current_chunk:
+            improved_chunks.append(current_chunk.strip())
+
+        # 너무 큰 청크 분할
+        final_chunks = []
+        for chunk in improved_chunks:
+            if len(chunk) > self.config.max_chunk_size * 1.5:
+                # 문장 단위로 재분할
+                sentences = self.text_splitter.split_into_sentences(chunk)
+                sub_chunks = self._fallback_chunking(sentences)
+                final_chunks.extend(sub_chunks)
+            else:
+                final_chunks.append(chunk)
+
+        return final_chunks
 

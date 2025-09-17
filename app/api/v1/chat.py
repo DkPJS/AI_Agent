@@ -303,43 +303,35 @@ async def generate_answer(request: Request):
         )
 
 def create_prompt(question: str, context: str, sources: List[Dict[str, Any]]) -> str:
-    """LLM 호출용 프롬프트 생성"""
-    # 소스 정보 서식화
-    source_info = ""
-    for i, source in enumerate(sources):
-        filename = source.get("filename", "알 수 없는 문서")
-        document_id = source.get("document_id", "")
-        chunk_id = source.get("chunk_id", "")
-        
-        # 페이지 정보 추출 시도
-        page_info = ""
+    """최적화된 LLM 호출용 프롬프트 생성"""
+    # 소스 정보 간단히 추출
+    source_files = []
+    for source in sources:
+        filename = source.get("filename", "문서")
         content = source.get("content", "")
         page_match = re.search(r'\[페이지\s*(\d+)\]', content)
         if page_match:
-            page_info = f", 페이지: {page_match.group(1)}"
-        
-        source_info += f"출처 {i+1}: {filename}{page_info} (문서ID: {document_id[:8]}...)\n"
-    
-    # 프롬프트 템플릿
-    prompt = f"""너는 문서를 검색해서 질문에 답변하는 지식 비서야. 제공된 문서 내용을 기반으로 질문에 정확하게 답변해줘.
+            source_files.append(f"{filename}(p.{page_match.group(1)})")
+        else:
+            source_files.append(filename)
+
+    # 중복 제거
+    unique_sources = list(dict.fromkeys(source_files))
+
+    # 간결하고 효과적인 프롬프트
+    prompt = f"""질문에 대해 제공된 문서 내용을 바탕으로 정확하고 유용한 답변을 제공하세요.
 
 질문: {question}
 
 관련 문서 내용:
 {context}
 
-출처 정보:
-{source_info}
+답변 가이드라인:
+- 문서 내용에 기반한 정확한 정보 제공
+- 구체적이고 실용적인 답변 구성
+- 문서에 없는 내용은 "관련 정보를 찾을 수 없습니다"로 명시
+- 답변 마지막에 "[출처: {', '.join(unique_sources[:3])}]" 형식으로 출처 표시
 
-지침:
-1. 관련 문서 내용에 있는 정보만 사용해서 답변해줘.
-2. 문서 내용에 없는 정보는 "제공된 문서에 관련 정보가 없습니다"라고 솔직하게 말해줘.
-3. 답변은 상세하게게 논리적으로 구성해줘.
-4. 반드시 답변 내용에서 "[파일명, 페이지]" 형식으로 정보의 출처를 인용해줘. 예: [평가지침서.pdf, 페이지 5] 
-5. 페이지 정보가 없으면 파일명만 표시해줘. 예: [평가지침서.pdf]
-6. 답변 끝에 "참고한 출처:" 형식으로 사용한 모든 출처 파일명을 명시해줘.
-7. 반드시 한국어로만 답변해야 합니다. 영어로 답변하지 마세요.
-
-답변(한국어로만 작성할 것, 반드시 출처 표시 포함):"""
+답변:"""
 
     return prompt

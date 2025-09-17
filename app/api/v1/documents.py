@@ -94,50 +94,57 @@ async def upload_document(
         db.commit()
         logging.info(f"문서 DB 저장 완료: id={document_id}")
         
-        # 3. 문서 처리 (텍스트 추출)
+        # 3. 문서 처리 (텍스트 추출 및 스마트 청킹)
         try:
             processor = BaseDocumentProcessor.get_processor(file_path)
-            chunks = processor.process(file_path)
+            raw_chunks = processor.process(file_path)
+
+            # 개선된 의미 기반 청킹 적용
+            from app.services.document.semantic_chunker import SemanticChunker
+            semantic_chunker = SemanticChunker()
+
+            # 원본 청크들을 합쳐서 전체 텍스트 구성
+            full_text = "\n\n".join(raw_chunks)
+
+            # 문서 유형에 따른 스마트 청킹 (구조 분석 완료 후 실행)
+            chunks = []
             
             # 처리 결과 검증 (빈 리스트거나 오류 메시지만 있는 경우)
-            if not chunks:
+            if not raw_chunks:
                 # 청크가 없으면
                 logging.error(f"문서에서 텍스트를 추출할 수 없습니다: {file_path}")
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail="문서에서 텍스트를 추출할 수 없습니다."
                 )
-            
+
             # 에러 메시지가 있는지 확인 (첫 번째 청크가 오류 메시지인 경우)
-            if len(chunks) == 1 and any(chunks[0].startswith(prefix) for prefix in ["PDF 파일", "DOCX 파일", "HWP 파일", "Excel 파일"]):
-                logging.error(f"문서 처리 오류: {chunks[0]}")
+            if len(raw_chunks) == 1 and any(raw_chunks[0].startswith(prefix) for prefix in ["PDF 파일", "DOCX 파일", "HWP 파일", "Excel 파일"]):
+                logging.error(f"문서 처리 오류: {raw_chunks[0]}")
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail=chunks[0]
+                    detail=raw_chunks[0]
                 )
+
+            logging.info(f"문서 텍스트 추출 완료: {len(raw_chunks)}개 원본 청크")
             
-            logging.info(f"문서 텍스트 추출 완료: {len(chunks)}개 청크")
-            
-            # 3.1 문서 구조 분석 및 분류 (새로 추가된 부분)
+            # 3.1 문서 구조 분석 및 분류
             document_structure = {}
-            document_type = "일반문서"
-            
+            document_type = "general"  # 기본값을 영어로 변경 (SemanticChunker 호환)
+
             if do_analyze_structure:
                 try:
-                    # 전체 텍스트 구성
-                    full_text = "\n\n".join(chunks)
-                    
                     # 문서 구조 추출
                     structure_extractor = DocumentStructureExtractor()
                     document_structure = structure_extractor.extract_structure(full_text)
-                    
+
                     # 문서 유형 분류
                     document_type = processor.classify_document_type(full_text, document_structure)
-                    
+
                     logging.info(f"문서 구조 분석 완료: {len(document_structure.get('headers', []))}개 헤더, " +
                                 f"{len(document_structure.get('sections', []))}개 섹션 발견")
                     logging.info(f"문서 유형 분류 결과: {document_type}")
-                    
+
                     # 메타데이터 업데이트
                     if 'metadata' in document_structure and document_structure['metadata']:
                         # 문서 설명이 비어있을 경우에만 자동 생성된 제목 사용
@@ -149,6 +156,26 @@ async def upload_document(
                 except Exception as structure_error:
                     logging.error(f"문서 구조 분석 중 오류: {str(structure_error)}")
                     # 구조 분석 실패해도 계속 진행
+
+            # 3.2 스마트 청킹 실행
+            try:
+                # 문서 특성에 맞는 최적 청킹 수행
+                chunked_results = semantic_chunker.chunk_document(full_text, document_type)
+
+                # 청크 내용만 추출
+                chunks = [chunk_data["content"] for chunk_data in chunked_results]
+
+                logging.info(f"스마트 청킹 완료: {len(raw_chunks)}개 원본 → {len(chunks)}개 최적화된 청크")
+
+                # 청킹 품질 정보 로깅
+                if chunked_results:
+                    avg_chunk_size = sum(len(chunk) for chunk in chunks) / len(chunks)
+                    logging.info(f"청킹 품질: 평균 크기 {avg_chunk_size:.0f}자, 방법: 적응형 의미 기반")
+
+            except Exception as chunking_error:
+                logging.error(f"스마트 청킹 실패, 원본 청킹 사용: {str(chunking_error)}")
+                # 스마트 청킹 실패 시 원본 청킹 사용
+                chunks = raw_chunks
                     
         except Exception as e:
             logging.error(f"문서 처리 중 오류: {str(e)}")

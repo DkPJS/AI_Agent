@@ -108,51 +108,180 @@ class GraphRetriever:
         return context_str, sources
     
     def _combine_results(
-        self, 
-        vector_results: List[Dict[str, Any]], 
+        self,
+        vector_results: List[Dict[str, Any]],
         entity_results: List[Dict[str, Any]],
         graph_results: List[Dict[str, Any]],
         limit: int = 5
     ) -> List[Dict[str, Any]]:
         """
-        검색 결과 통합 및 중복 제거
-        
+        스마트 검색 결과 통합 및 중복 제거
+
         Args:
             vector_results: 벡터 검색 결과
             entity_results: 엔티티 검색 결과
             graph_results: 그래프 검색 결과
             limit: 결과 제한 수
-            
+
         Returns:
-            중복 제거된 통합 결과
+            품질 점수 기반 정렬된 통합 결과
         """
-        # 결과 통합
-        all_results = []
-        seen_chunks = set()
-        
-        # 벡터 검색 결과 추가 (우선순위 높음)
+        # 검색 방법별 가중치 설정
+        method_weights = {
+            "vector": 0.4,    # 벡터 검색 신뢰도
+            "entity": 0.3,    # 엔티티 검색 신뢰도
+            "graph": 0.3      # 그래프 검색 신뢰도
+        }
+
+        # 결과 통합 및 점수 계산
+        combined_chunks = {}
+
+        # 벡터 검색 결과 처리
         for result in vector_results:
             chunk_id = result.get("chunk_id")
-            if chunk_id and chunk_id not in seen_chunks:
-                seen_chunks.add(chunk_id)
-                all_results.append(result)
-        
-        # 엔티티 검색 결과 추가
+            if chunk_id:
+                base_score = result.get("relevance", 0.5)
+                quality_score = self._calculate_content_quality(result.get("content", ""))
+                combined_score = (base_score * method_weights["vector"]) + (quality_score * 0.2)
+
+                combined_chunks[chunk_id] = {
+                    **result,
+                    "combined_score": combined_score,
+                    "search_methods": ["vector"],
+                    "method_scores": {"vector": base_score}
+                }
+
+        # 엔티티 검색 결과 처리
         for result in entity_results:
             chunk_id = result.get("chunk_id")
-            if chunk_id and chunk_id not in seen_chunks:
-                seen_chunks.add(chunk_id)
-                all_results.append(result)
-        
-        # 그래프 검색 결과 추가
+            if chunk_id:
+                base_score = result.get("relevance", 0.5)
+                quality_score = self._calculate_content_quality(result.get("content", ""))
+                entity_score = (base_score * method_weights["entity"]) + (quality_score * 0.2)
+
+                if chunk_id in combined_chunks:
+                    # 기존 청크에 점수 추가
+                    combined_chunks[chunk_id]["combined_score"] += entity_score * 0.5  # 부스트
+                    combined_chunks[chunk_id]["search_methods"].append("entity")
+                    combined_chunks[chunk_id]["method_scores"]["entity"] = base_score
+                else:
+                    combined_chunks[chunk_id] = {
+                        **result,
+                        "combined_score": entity_score,
+                        "search_methods": ["entity"],
+                        "method_scores": {"entity": base_score}
+                    }
+
+        # 그래프 검색 결과 처리
         for result in graph_results:
             chunk_id = result.get("chunk_id")
-            if chunk_id and chunk_id not in seen_chunks:
-                seen_chunks.add(chunk_id)
-                all_results.append(result)
-        
-        # 상위 N개 결과만 반환
-        return all_results[:limit]
+            if chunk_id:
+                base_score = result.get("relevance", 0.5)
+                quality_score = self._calculate_content_quality(result.get("content", ""))
+                graph_score = (base_score * method_weights["graph"]) + (quality_score * 0.2)
+
+                if chunk_id in combined_chunks:
+                    # 기존 청크에 점수 추가
+                    combined_chunks[chunk_id]["combined_score"] += graph_score * 0.4  # 부스트
+                    combined_chunks[chunk_id]["search_methods"].append("graph")
+                    combined_chunks[chunk_id]["method_scores"]["graph"] = base_score
+                else:
+                    combined_chunks[chunk_id] = {
+                        **result,
+                        "combined_score": graph_score,
+                        "search_methods": ["graph"],
+                        "method_scores": {"graph": base_score}
+                    }
+
+        # 다중 검색 방법에서 발견된 청크에 추가 부스트
+        for chunk_id, chunk_data in combined_chunks.items():
+            if len(chunk_data["search_methods"]) > 1:
+                boost_factor = 1 + (len(chunk_data["search_methods"]) - 1) * 0.2
+                chunk_data["combined_score"] *= boost_factor
+
+        # 점수 기반 정렬 및 다양성 확보
+        sorted_results = sorted(
+            combined_chunks.values(),
+            key=lambda x: x["combined_score"],
+            reverse=True
+        )
+
+        # 상위 결과 선택 (다양성 고려)
+        final_results = self._ensure_diversity(sorted_results, limit)
+
+        logging.info(f"검색 결과 통합 완료: {len(combined_chunks)}개 고유 청크 → {len(final_results)}개 최종 선택")
+        return final_results
+
+    def _calculate_content_quality(self, content: str) -> float:
+        """콘텐츠 품질 점수 계산"""
+        if not content:
+            return 0.0
+
+        quality_factors = []
+
+        # 길이 적절성 (너무 짧거나 길지 않은 것이 좋음)
+        length = len(content)
+        if 100 <= length <= 1000:
+            quality_factors.append(0.3)
+        elif 50 <= length < 100 or 1000 < length <= 2000:
+            quality_factors.append(0.2)
+        else:
+            quality_factors.append(0.1)
+
+        # 문장 완성도 (마침표로 끝나는지)
+        if content.strip().endswith(('.', '다', '음', '됨')):
+            quality_factors.append(0.2)
+        else:
+            quality_factors.append(0.1)
+
+        # 정보 밀도 (숫자, 한글 비율)
+        import re
+        korean_chars = len(re.findall(r'[가-힣]', content))
+        numbers = len(re.findall(r'\d+', content))
+        info_density = (korean_chars + numbers * 2) / len(content) if content else 0
+
+        if info_density > 0.7:
+            quality_factors.append(0.3)
+        elif info_density > 0.5:
+            quality_factors.append(0.2)
+        else:
+            quality_factors.append(0.1)
+
+        # 구조화 정도 (제목, 번호 등)
+        if re.search(r'^\d+\.|\n\d+\.|\n-|제\d+조|제\d+항', content):
+            quality_factors.append(0.2)
+        else:
+            quality_factors.append(0.1)
+
+        return sum(quality_factors)
+
+    def _ensure_diversity(self, sorted_results: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+        """결과 다양성 확보"""
+        if len(sorted_results) <= limit:
+            return sorted_results
+
+        final_results = []
+        used_documents = set()
+
+        # 첫 번째 패스: 서로 다른 문서에서 선택
+        for result in sorted_results:
+            if len(final_results) >= limit:
+                break
+
+            doc_id = result.get("document_id", "")
+            if doc_id not in used_documents:
+                final_results.append(result)
+                used_documents.add(doc_id)
+
+        # 두 번째 패스: 남은 슬롯을 점수 순으로 채움
+        for result in sorted_results:
+            if len(final_results) >= limit:
+                break
+
+            if result not in final_results:
+                final_results.append(result)
+
+        return final_results[:limit]
     
     def _expand_query_with_synonyms(self, query: str) -> str:
         """

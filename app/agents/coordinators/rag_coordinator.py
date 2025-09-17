@@ -65,9 +65,29 @@ class RAGCoordinator(BaseAgent):
             "retrieval_threshold": 0.7,
             "context_window_size": 4,
             "reranking_enabled": True,
-            "hybrid_weight_ratio": 0.7,  # semantic vs keyword
             "generation_temperature": 0.7,
             "max_context_chunks": 5
+        }
+
+        # 동적 가중치 시스템
+        self.dynamic_weights = {
+            "base_weights": {
+                "semantic": 0.6,
+                "keyword": 0.25,
+                "graph": 0.15
+            },
+            "question_type_adjustments": {
+                "factual": {"semantic": 0.7, "keyword": 0.2, "graph": 0.1},
+                "comparison": {"semantic": 0.5, "keyword": 0.25, "graph": 0.25},
+                "summary": {"semantic": 0.65, "keyword": 0.3, "graph": 0.05},
+                "procedural": {"semantic": 0.4, "keyword": 0.4, "graph": 0.2},
+                "causal": {"semantic": 0.45, "keyword": 0.15, "graph": 0.4}
+            },
+            "performance_adjustments": {
+                "high_quality": {"semantic": 1.0, "keyword": 1.0, "graph": 1.0},
+                "medium_quality": {"semantic": 0.9, "keyword": 1.1, "graph": 1.0},
+                "low_quality": {"semantic": 0.8, "keyword": 1.2, "graph": 1.1}
+            }
         }
         
         # 성능 최적화 상태
@@ -300,41 +320,189 @@ class RAGCoordinator(BaseAgent):
     async def _execute_adaptive_retrieval(
         self, query: str, strategy: str, entities: List[str]
     ) -> Tuple[str, List[Dict[str, Any]]]:
-        """적응형 검색 실행"""
-        if strategy == "hybrid":
-            # 하이브리드 검색 (벡터 + 키워드)
+        """동적 가중치 기반 적응형 검색 실행"""
+        # 질문 유형 분석
+        question_type, _ = self.question_analyzer.analyze_question(query)
+
+        # 동적 가중치 계산
+        search_weights = self._calculate_dynamic_weights(question_type, query)
+
+        # 다중 검색 방법 실행
+        search_results = {}
+
+        # 시맨틱 검색
+        if search_weights["semantic"] > 0.1:
             semantic_results = await self.embedder.search_similar_chunks(
-                query, limit=self.adaptive_params["max_context_chunks"]
+                query, limit=min(self.adaptive_params["max_context_chunks"] + 2, 8)
             )
-            keyword_results = await self.search_strategy.execute_search(
-                query, "factual", entities
+            search_results["semantic"] = semantic_results
+
+        # 키워드 검색 (기존 search_strategy 활용)
+        if search_weights["keyword"] > 0.1:
+            keyword_context, keyword_sources = await self.search_strategy.execute_search(
+                query, question_type, entities
             )
-            
-            # 결과 융합
-            context, sources = await self._fuse_search_results(
-                semantic_results, keyword_results[1] if keyword_results else []
+            search_results["keyword"] = keyword_sources
+
+        # 그래프 검색
+        if search_weights["graph"] > 0.1:
+            graph_context, graph_sources = await self.graph_retriever.retrieve(
+                query, limit=min(self.adaptive_params["max_context_chunks"], 5)
             )
-            
-        elif strategy == "graph_enhanced":
-            # 그래프 강화 검색
-            context, sources = await self.graph_retriever.retrieve(
-                query, limit=self.adaptive_params["max_context_chunks"]
-            )
-            
-        elif strategy == "semantic_focused":
-            # 시맨틱 중심 검색
-            sources = await self.embedder.search_similar_chunks(
-                query, limit=self.adaptive_params["max_context_chunks"]
-            )
-            context = "\n\n".join([source.get("content", "") for source in sources])
-            
-        else:
-            # 기본 하이브리드
-            context, sources = await self.search_strategy.execute_search(
-                query, "general", entities
-            )
-        
+            search_results["graph"] = graph_sources
+
+        # 가중치 기반 결과 융합
+        context, sources = await self._weighted_fusion_search_results(
+            search_results, search_weights, query
+        )
+
         return context, sources
+
+    def _calculate_dynamic_weights(self, question_type: str, query: str) -> Dict[str, float]:
+        """질문 유형과 성능 기반 동적 가중치 계산"""
+        # 기본 가중치
+        base_weights = self.dynamic_weights["base_weights"].copy()
+
+        # 질문 유형별 조정
+        if question_type in self.dynamic_weights["question_type_adjustments"]:
+            type_weights = self.dynamic_weights["question_type_adjustments"][question_type]
+            # 가중 평균으로 조정
+            for method in base_weights:
+                if method in type_weights:
+                    base_weights[method] = (base_weights[method] * 0.4 + type_weights[method] * 0.6)
+
+        # 성능 기반 조정
+        performance_level = self._assess_current_performance_level()
+        if performance_level in self.dynamic_weights["performance_adjustments"]:
+            perf_adjustments = self.dynamic_weights["performance_adjustments"][performance_level]
+            for method in base_weights:
+                if method in perf_adjustments:
+                    base_weights[method] *= perf_adjustments[method]
+
+        # 쿼리 특성 기반 미세 조정
+        base_weights = self._fine_tune_weights_by_query(base_weights, query)
+
+        # 정규화
+        total = sum(base_weights.values())
+        if total > 0:
+            base_weights = {k: v/total for k, v in base_weights.items()}
+
+        logging.info(f"동적 가중치 계산: {question_type} → {base_weights}")
+        return base_weights
+
+    def _assess_current_performance_level(self) -> str:
+        """현재 성능 수준 평가"""
+        if not self.rag_history:
+            return "medium_quality"
+
+        recent_records = self.rag_history[-10:]
+        avg_confidence = sum(r.get("confidence", 0.5) for r in recent_records) / len(recent_records)
+
+        if avg_confidence >= 0.8:
+            return "high_quality"
+        elif avg_confidence >= 0.6:
+            return "medium_quality"
+        else:
+            return "low_quality"
+
+    def _fine_tune_weights_by_query(self, weights: Dict[str, float], query: str) -> Dict[str, float]:
+        """쿼리 특성에 따른 가중치 미세 조정"""
+        # 숫자/수치 정보가 많은 쿼리는 키워드 검색 강화
+        import re
+        if len(re.findall(r'\d+', query)) >= 2:
+            weights["keyword"] *= 1.2
+            weights["semantic"] *= 0.9
+
+        # 긴 쿼리는 시맨틱 검색 강화
+        if len(query.split()) >= 10:
+            weights["semantic"] *= 1.1
+            weights["keyword"] *= 0.95
+
+        # 관계/연결 표현이 있는 쿼리는 그래프 검색 강화
+        relation_keywords = ['관계', '연결', '영향', '원인', '결과', '비교', '차이']
+        if any(keyword in query for keyword in relation_keywords):
+            weights["graph"] *= 1.3
+            weights["semantic"] *= 0.9
+
+        return weights
+
+    async def _weighted_fusion_search_results(
+        self, search_results: Dict[str, List[Dict[str, Any]]],
+        weights: Dict[str, float], query: str
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """가중치 기반 검색 결과 융합"""
+        all_results = []
+        seen_content = set()
+
+        # 각 검색 방법별로 가중치 적용하여 결과 처리
+        for method, results in search_results.items():
+            if method not in weights or weights[method] <= 0:
+                continue
+
+            method_weight = weights[method]
+
+            for result in results:
+                content = result.get("content", "")
+                content_hash = hash(content[:100])  # 중복 확인용
+
+                if content_hash not in seen_content and content.strip():
+                    # 가중치가 적용된 점수 계산
+                    base_relevance = result.get("relevance", 0.5)
+                    weighted_score = base_relevance * method_weight
+
+                    # 컨텍스트 품질 보너스
+                    quality_bonus = self._calculate_context_quality_bonus(content, query)
+                    final_score = weighted_score + quality_bonus
+
+                    enhanced_result = {
+                        **result,
+                        "weighted_score": final_score,
+                        "search_method": method,
+                        "method_weight": method_weight,
+                        "quality_bonus": quality_bonus
+                    }
+
+                    all_results.append(enhanced_result)
+                    seen_content.add(content_hash)
+
+        # 점수 기반 정렬
+        all_results.sort(key=lambda x: x.get("weighted_score", 0), reverse=True)
+
+        # 상위 결과 선택
+        top_results = all_results[:self.adaptive_params["max_context_chunks"]]
+
+        # 컨텍스트 문자열 구성
+        context = "\n\n".join([result.get("content", "") for result in top_results])
+
+        logging.info(f"가중치 융합 완료: {len(search_results)} 방법 → {len(top_results)} 최종 선택")
+        return context, top_results
+
+    def _calculate_context_quality_bonus(self, content: str, query: str) -> float:
+        """컨텍스트 품질 보너스 계산"""
+        if not content or not query:
+            return 0.0
+
+        bonus = 0.0
+
+        # 질문 키워드 매칭 보너스
+        import re
+        query_keywords = set(re.findall(r'[가-힣a-zA-Z]+', query.lower()))
+        content_keywords = set(re.findall(r'[가-힣a-zA-Z]+', content.lower()))
+
+        if query_keywords:
+            keyword_match_ratio = len(query_keywords.intersection(content_keywords)) / len(query_keywords)
+            bonus += keyword_match_ratio * 0.1
+
+        # 내용 길이 적정성 보너스
+        content_length = len(content)
+        if 200 <= content_length <= 800:
+            bonus += 0.05
+
+        # 구조화된 내용 보너스
+        if re.search(r'^\d+\.|\n\d+\.|\n-', content):
+            bonus += 0.03
+
+        return min(bonus, 0.2)  # 최대 0.2 보너스
     
     async def _optimize_context_for_generation(
         self, context: str, query: str, question_type: str
@@ -391,60 +559,301 @@ class RAGCoordinator(BaseAgent):
     async def _assess_answer_quality(
         self, question: str, answer: str, context: str, question_type: str
     ) -> float:
-        """개선된 답변 품질 평가"""
+        """고도화된 다층적 답변 품질 평가"""
         if not answer or answer.strip() == "":
+            return 0.05
+
+        # 초기 필터링 - 명백한 오류 답변
+        if self._is_error_response(answer):
             return 0.1
 
-        quality_factors = []
+        # 질문 유형별 평가 가중치
+        type_weights = self._get_question_type_weights(question_type)
 
-        # 1. 기본 답변 완성도 (0.3)
-        if len(answer.strip()) < 10:
-            quality_factors.append(0.1)  # 너무 짧음
-        elif "오류가 발생했습니다" in answer or "정보를 찾을 수 없습니다" in answer:
-            quality_factors.append(0.15)  # 오류 메시지
-        elif answer.count('.') >= 2 and len(answer.split()) >= 15:
-            quality_factors.append(0.3)  # 완전한 문장들
-        else:
-            quality_factors.append(0.2)  # 적당한 답변
+        # 다층적 품질 평가
+        quality_scores = {}
 
-        # 2. 질문 관련성 (0.25)
-        import re
-        question_keywords = set(re.findall(r'[가-힣a-zA-Z]+', question.lower()))
-        answer_keywords = set(re.findall(r'[가-힣a-zA-Z]+', answer.lower()))
+        # 1. 답변 완성도 및 구조 평가
+        quality_scores["completeness"] = self._evaluate_answer_completeness(answer, question)
 
-        if question_keywords:
-            relevance = len(question_keywords.intersection(answer_keywords)) / len(question_keywords)
-            quality_factors.append(relevance * 0.25)
-        else:
-            quality_factors.append(0.15)
+        # 2. 정보 정확성 및 관련성 평가
+        quality_scores["relevance"] = self._evaluate_answer_relevance(question, answer, context)
 
-        # 3. 컨텍스트 기반 정보 활용도 (0.25)
-        if context and len(context.strip()) > 0:
-            context_keywords = set(re.findall(r'[가-힣a-zA-Z]+', context.lower()))
-            if context_keywords:
-                context_usage = len(context_keywords.intersection(answer_keywords)) / len(context_keywords)
-                quality_factors.append(min(context_usage * 1.5, 0.25))  # 최대 0.25
-            else:
-                quality_factors.append(0.15)
-        else:
-            quality_factors.append(0.1)  # 컨텍스트 없음
+        # 3. 컨텍스트 활용도 평가
+        quality_scores["context_utilization"] = self._evaluate_context_utilization(answer, context)
 
-        # 4. 한국어 자연스러움 (0.2)
-        korean_patterns = [
-            r'[가-힣]',  # 한글 포함
-            r'입니다|습니다|됩니다',  # 정중한 표현
-            r'[.!?]',  # 적절한 문장부호
+        # 4. 논리적 일관성 평가
+        quality_scores["logical_consistency"] = self._evaluate_logical_consistency(answer, question_type)
+
+        # 5. 실용성 및 유용성 평가
+        quality_scores["usefulness"] = self._evaluate_answer_usefulness(answer, question, question_type)
+
+        # 6. 언어 품질 평가
+        quality_scores["language_quality"] = self._evaluate_language_quality(answer)
+
+        # 질문 유형별 가중 평균 계산
+        weighted_score = sum(
+            quality_scores[factor] * type_weights[factor]
+            for factor in quality_scores if factor in type_weights
+        )
+
+        # 추가 보너스/페널티 적용
+        final_score = self._apply_quality_adjustments(weighted_score, answer, question, context)
+
+        return max(0.1, min(1.0, final_score))
+
+    def _is_error_response(self, answer: str) -> bool:
+        """오류 응답 판별"""
+        error_indicators = [
+            "오류가 발생했습니다",
+            "정보를 찾을 수 없습니다",
+            "죄송합니다",
+            "응답 생성 중 오류",
+            "관련 정보가 없습니다"
         ]
-        naturalness_score = 0
-        for pattern in korean_patterns:
-            if re.search(pattern, answer):
-                naturalness_score += 1
-        quality_factors.append((naturalness_score / len(korean_patterns)) * 0.2)
+        return any(indicator in answer for indicator in error_indicators)
 
-        total_score = sum(quality_factors)
+    def _get_question_type_weights(self, question_type: str) -> Dict[str, float]:
+        """질문 유형별 평가 가중치"""
+        weight_maps = {
+            "factual": {
+                "completeness": 0.25,
+                "relevance": 0.30,
+                "context_utilization": 0.25,
+                "logical_consistency": 0.10,
+                "usefulness": 0.05,
+                "language_quality": 0.05
+            },
+            "comparison": {
+                "completeness": 0.20,
+                "relevance": 0.25,
+                "context_utilization": 0.20,
+                "logical_consistency": 0.25,
+                "usefulness": 0.05,
+                "language_quality": 0.05
+            },
+            "summary": {
+                "completeness": 0.30,
+                "relevance": 0.20,
+                "context_utilization": 0.30,
+                "logical_consistency": 0.10,
+                "usefulness": 0.05,
+                "language_quality": 0.05
+            },
+            "procedural": {
+                "completeness": 0.25,
+                "relevance": 0.20,
+                "context_utilization": 0.15,
+                "logical_consistency": 0.20,
+                "usefulness": 0.15,
+                "language_quality": 0.05
+            }
+        }
+        return weight_maps.get(question_type, weight_maps["factual"])
 
-        # 최소/최대 값 제한
-        return max(0.1, min(1.0, total_score))
+    def _evaluate_answer_completeness(self, answer: str, question: str) -> float:
+        """답변 완성도 평가"""
+        score = 0.0
+
+        # 길이 적절성 (30%)
+        answer_length = len(answer.strip())
+        if 50 <= answer_length <= 500:
+            score += 0.3
+        elif 20 <= answer_length < 50 or 500 < answer_length <= 1000:
+            score += 0.2
+        elif answer_length > 1000:
+            score += 0.15
+        else:
+            score += 0.05
+
+        # 문장 구조 (25%)
+        sentences = answer.split('.')
+        complete_sentences = [s for s in sentences if len(s.strip()) > 5]
+        if len(complete_sentences) >= 2:
+            score += 0.25
+        elif len(complete_sentences) == 1:
+            score += 0.15
+        else:
+            score += 0.05
+
+        # 정보 밀도 (25%)
+        import re
+        info_elements = len(re.findall(r'[가-힣]{2,}|\d+|[A-Za-z]{3,}', answer))
+        info_density = info_elements / len(answer.split()) if answer.split() else 0
+        if info_density > 0.7:
+            score += 0.25
+        elif info_density > 0.5:
+            score += 0.15
+        else:
+            score += 0.05
+
+        # 결론성 (20%)
+        if answer.strip().endswith(('.', '다', '습니다', '됩니다')):
+            score += 0.2
+        else:
+            score += 0.1
+
+        return min(1.0, score)
+
+    def _evaluate_answer_relevance(self, question: str, answer: str, context: str) -> float:
+        """답변 관련성 평가"""
+        import re
+
+        # 키워드 매칭
+        question_words = set(re.findall(r'[가-힣a-zA-Z]+', question.lower()))
+        answer_words = set(re.findall(r'[가-힣a-zA-Z]+', answer.lower()))
+
+        if not question_words:
+            return 0.5
+
+        # 직접 매칭 (60%)
+        direct_match_ratio = len(question_words.intersection(answer_words)) / len(question_words)
+        relevance_score = direct_match_ratio * 0.6
+
+        # 의미적 관련성 (40%) - 간접적 관련 키워드
+        semantic_keywords = self._extract_semantic_keywords(question)
+        semantic_match = len(semantic_keywords.intersection(answer_words)) / len(semantic_keywords) if semantic_keywords else 0
+        relevance_score += semantic_match * 0.4
+
+        return min(1.0, relevance_score)
+
+    def _extract_semantic_keywords(self, question: str) -> set:
+        """질문에서 의미적 관련 키워드 추출"""
+        # 간단한 동의어/관련어 매핑
+        semantic_map = {
+            "방법": ["절차", "과정", "단계"],
+            "기준": ["조건", "요건", "표준"],
+            "평가": ["심사", "검토", "판단"],
+            "지원": ["도움", "보조", "원조"],
+            "결과": ["성과", "효과", "산출물"]
+        }
+
+        related_words = set()
+        for word in question.split():
+            if word in semantic_map:
+                related_words.update(semantic_map[word])
+
+        return related_words
+
+    def _evaluate_context_utilization(self, answer: str, context: str) -> float:
+        """컨텍스트 활용도 평가"""
+        if not context or not context.strip():
+            return 0.3  # 컨텍스트가 없으면 중간값
+
+        import re
+        context_words = set(re.findall(r'[가-힣a-zA-Z]+', context.lower()))
+        answer_words = set(re.findall(r'[가-힣a-zA-Z]+', answer.lower()))
+
+        if not context_words:
+            return 0.3
+
+        # 컨텍스트 활용률
+        utilization_ratio = len(context_words.intersection(answer_words)) / len(context_words)
+
+        # 과도한 복사 방지 - 너무 많이 활용하면 패널티
+        if utilization_ratio > 0.8:
+            return min(1.0, utilization_ratio * 0.8)
+        else:
+            return min(1.0, utilization_ratio * 1.2)
+
+    def _evaluate_logical_consistency(self, answer: str, question_type: str) -> float:
+        """논리적 일관성 평가"""
+        score = 0.5  # 기본 점수
+
+        # 논리적 연결어 사용
+        logical_connectors = ["따라서", "그러므로", "하지만", "그러나", "또한", "또는", "즉"]
+        connector_count = sum(1 for connector in logical_connectors if connector in answer)
+        if connector_count > 0:
+            score += min(0.2, connector_count * 0.1)
+
+        # 모순 확인 (기본적인 패턴만)
+        contradictions = ["아니다" in answer and "맞다" in answer,
+                         "불가능" in answer and "가능" in answer]
+        if any(contradictions):
+            score -= 0.3
+
+        # 질문 유형별 논리 구조
+        if question_type == "comparison" and ("비교" in answer or "차이" in answer):
+            score += 0.2
+
+        return max(0.0, min(1.0, score))
+
+    def _evaluate_answer_usefulness(self, answer: str, question: str, question_type: str) -> float:
+        """답변 유용성 평가"""
+        score = 0.5
+
+        # 구체적 정보 제공 (숫자, 날짜, 구체적 명사)
+        import re
+        specific_info = len(re.findall(r'\d+|[가-힣]{2,}(?:법|규정|기준|절차)', answer))
+        if specific_info > 0:
+            score += min(0.3, specific_info * 0.1)
+
+        # 실행 가능한 조언
+        actionable_words = ["해야", "필요", "권장", "방법", "단계"]
+        actionable_count = sum(1 for word in actionable_words if word in answer)
+        if actionable_count > 0:
+            score += min(0.2, actionable_count * 0.1)
+
+        return min(1.0, score)
+
+    def _evaluate_language_quality(self, answer: str) -> float:
+        """언어 품질 평가"""
+        score = 0.0
+
+        # 한국어 자연스러움
+        import re
+        korean_endings = len(re.findall(r'습니다|입니다|됩니다|다$', answer))
+        total_sentences = len([s for s in answer.split('.') if s.strip()])
+        if total_sentences > 0:
+            politeness_ratio = korean_endings / total_sentences
+            score += min(0.4, politeness_ratio * 0.6)
+
+        # 문법적 완성도 (기본적인 체크)
+        if not re.search(r'[가-힣]\s+[가-힣]', answer):  # 어색한 띄어쓰기 없음
+            score += 0.3
+
+        # 적절한 문장부호 사용
+        punctuation_score = min(0.3, answer.count('.') * 0.1 + answer.count(',') * 0.05)
+        score += punctuation_score
+
+        return min(1.0, score)
+
+    def _apply_quality_adjustments(self, base_score: float, answer: str, question: str, context: str) -> float:
+        """추가 품질 조정"""
+        adjusted_score = base_score
+
+        # 출처 표시 보너스
+        if "[출처:" in answer or "참고:" in answer:
+            adjusted_score += 0.05
+
+        # 답변 길이 극단값 패널티
+        if len(answer) < 10:
+            adjusted_score *= 0.5
+        elif len(answer) > 2000:
+            adjusted_score *= 0.9
+
+        # 질문 직접 답변 여부
+        if self._directly_answers_question(question, answer):
+            adjusted_score += 0.1
+
+        return adjusted_score
+
+    def _directly_answers_question(self, question: str, answer: str) -> bool:
+        """질문에 직접 답변하는지 확인"""
+        # 질문의 의문사와 답변의 대응 확인
+        question_patterns = {
+            "무엇": ["것은", "것이", "내용", "정보"],
+            "어떻게": ["방법", "절차", "과정"],
+            "언제": ["때", "시기", "일정"],
+            "어디": ["곳", "장소", "위치"],
+            "왜": ["이유", "원인", "목적"]
+        }
+
+        for pattern, responses in question_patterns.items():
+            if pattern in question and any(response in answer for response in responses):
+                return True
+
+        return False
     
     async def _fuse_search_results(
         self, semantic_results: List[Dict[str, Any]], keyword_results: List[Dict[str, Any]]
