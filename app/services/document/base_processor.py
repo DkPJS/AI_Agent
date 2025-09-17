@@ -35,13 +35,15 @@ class BaseDocumentProcessor(ABC):
         Returns:
             BaseDocumentProcessor: 적절한 프로세서 인스턴스
         """
-        from app.processors.pdf_processor import PDFProcessor
-        from app.processors.docx_processor import DocxProcessor
-        from app.processors.excel_processor import ExcelProcessor
-        from app.processors.hwp_processor import HwpProcessor
-        
+        from app.services.document.pdf_processor import PDFProcessor
+        from app.services.document.docx_processor import DocxProcessor
+        from app.services.document.excel_processor import ExcelProcessor
+        from app.services.document.hwp_processor import HwpProcessor
+        from app.services.document.text_processor import TextProcessor
+
+
         ext = os.path.splitext(file_path)[1].lower()
-        
+
         if ext == '.pdf':
             return PDFProcessor()
         elif ext == '.docx':
@@ -50,54 +52,84 @@ class BaseDocumentProcessor(ABC):
             return ExcelProcessor()
         elif ext == '.hwp':
             return HwpProcessor()
+        elif ext == '.txt':
+            return TextProcessor()
         else:
             raise ValueError(f"지원하지 않는 파일 형식입니다: {ext}")
     
     @staticmethod
-    def chunk_text(text: str, max_chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+    def chunk_text(text: str, max_chunk_size: int = 1000, overlap: int = 200,
+                   use_semantic: bool = True, document_type: str = "general") -> List[Dict[str, Any]]:
         """
-        긴 텍스트를 오버랩이 있는 청크로 분할
-        
+        지능형 텍스트 청킹 (의미 기반 또는 기존 방식)
+
         Args:
             text (str): 분할할 텍스트
             max_chunk_size (int): 최대 청크 크기 (문자 단위)
-            overlap (int): 청크 간 오버랩 크기
-            
+            overlap (int): 청크 간 오버랩 크기 (기존 방식에서만 사용)
+            use_semantic (bool): 의미 기반 청킹 사용 여부
+            document_type (str): 문서 유형 (general, report, manual, contract)
+
         Returns:
-            List[str]: 분할된 텍스트 청크 목록
+            List[Dict]: 분할된 텍스트 청크 정보 목록 (content, metadata 포함)
         """
-        if not text or len(text) <= max_chunk_size:
-            return [text] if text else []
-        
+        if not text:
+            return []
+
+        if use_semantic:
+            try:
+                from app.services.document.semantic_chunker import SemanticChunker
+                from app.services.document.chunking_config import ChunkingConfig
+
+                config = ChunkingConfig(max_chunk_size=max_chunk_size)
+                chunker = SemanticChunker(config=config)
+                return chunker.chunk_document(text, document_type)
+            except Exception as e:
+                logging.warning(f"의미 기반 청킹 실패, 기존 방식 사용: {e}")
+
+        # 기존 방식 (호환성 유지)
+        if len(text) <= max_chunk_size:
+            return [{"content": text, "metadata": {"chunking_method": "simple", "size": len(text)}}]
+
         chunks = []
         start = 0
-        
+
         while start < len(text):
             end = min(start + max_chunk_size, len(text))
-            
+
             # 문장 또는 단락 경계에서 끊기 위해 적절한 위치 찾기
             if end < len(text):
                 # 단락 경계 찾기 (더 우선)
                 paragraph_boundary = text.rfind('\n\n', start, end)
-                
+
                 # 문장 경계 찾기
                 sentence_boundary = max(
                     text.rfind('. ', start, end),
                     text.rfind('? ', start, end),
                     text.rfind('! ', start, end)
                 )
-                
+
                 if paragraph_boundary > start + max_chunk_size // 2:
                     end = paragraph_boundary + 2  # '\n\n' 포함
                 elif sentence_boundary > start + max_chunk_size // 2:
                     end = sentence_boundary + 2  # '. ' 포함
-            
-            chunks.append(text[start:end].strip())
-            
+
+            chunk_content = text[start:end].strip()
+            if chunk_content:
+                chunks.append({
+                    "content": chunk_content,
+                    "metadata": {
+                        "chunking_method": "simple",
+                        "size": len(chunk_content),
+                        "start_pos": start,
+                        "end_pos": end
+                    }
+                })
+
             # 다음 시작 위치 (오버랩 고려)
             start = end - overlap if end < len(text) else len(text)
-        
-        return [chunk for chunk in chunks if chunk]  # 빈 청크 제거
+
+        return chunks
     
     def classify_document_type(self, text: str, structure: Dict) -> str:
         """

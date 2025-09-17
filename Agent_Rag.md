@@ -142,7 +142,7 @@
 
   ---
   
-  6. 고급 기능
+  6. 기능
   지능형 동의어 시스템
   - 문서별 자동 동의어 탐지
   - 도메인 특화 용어 매핑
@@ -231,7 +231,7 @@
       │   │   ├── 📄 graph_retriever.py       # 그래프 기반 검색
       │   │   ├── 📄 question_analyzer.py     # 질문 분석기
       │   │   └── 📄 search_strategy.py       # 검색 전략 관리
-      │   └── 📁 utils/                       #  RAG 유틸리티
+      │   └── 📁 utils/                       # RAG 유틸리티
       │       ├── 📄 cypher_queries.py        # Cypher 쿼리 템플릿
       │       └── 📄 domain_config.py         # 도메인별 설정
       │

@@ -368,21 +368,22 @@ class RAGCoordinator(BaseAgent):
             query, result.get("answer", ""), context, question_type
         )
         
-        # 낮은 품질의 경우 재생성 시도
-        if confidence < 0.6:
-            logging.info(f"Low quality answer detected (confidence: {confidence}), regenerating...")
+        # 낮은 품질의 경우 재생성 시도 (임계값을 0.5로 낮춤)
+        if confidence < 0.5:
+            logging.info(f"Low quality answer detected (confidence: {confidence:.3f}), regenerating...")
             # 다른 파라미터로 재생성 (실제 구현에서는 LLM 파라미터 조정)
             result = await self.qa_system.answer_question(query)
             confidence = await self._assess_answer_quality(
                 query, result.get("answer", ""), context, question_type
             )
+            logging.info(f"Regenerated answer quality: {confidence:.3f}")
         
         return {
             "answer": result.get("answer", ""),
             "confidence": confidence,
             "sources": sources,
             "generation_metadata": {
-                "regeneration_attempts": 1 if confidence < 0.6 else 0,
+                "regeneration_attempts": 1 if confidence < 0.5 else 0,
                 "question_type": question_type
             }
         }
@@ -390,32 +391,60 @@ class RAGCoordinator(BaseAgent):
     async def _assess_answer_quality(
         self, question: str, answer: str, context: str, question_type: str
     ) -> float:
-        """답변 품질 평가"""
+        """개선된 답변 품질 평가"""
+        if not answer or answer.strip() == "":
+            return 0.1
+
         quality_factors = []
-        
-        # 답변 길이 적절성
-        answer_length = len(answer.split())
-        if question_type == "factual" and 10 <= answer_length <= 50:
-            quality_factors.append(0.3)
-        elif question_type == "summary" and 50 <= answer_length <= 200:
-            quality_factors.append(0.3)
+
+        # 1. 기본 답변 완성도 (0.3)
+        if len(answer.strip()) < 10:
+            quality_factors.append(0.1)  # 너무 짧음
+        elif "오류가 발생했습니다" in answer or "정보를 찾을 수 없습니다" in answer:
+            quality_factors.append(0.15)  # 오류 메시지
+        elif answer.count('.') >= 2 and len(answer.split()) >= 15:
+            quality_factors.append(0.3)  # 완전한 문장들
         else:
-            quality_factors.append(0.1)
-        
-        # 컨텍스트 활용도
-        context_words = set(context.lower().split())
-        answer_words = set(answer.lower().split())
-        overlap = len(context_words.intersection(answer_words))
-        context_utilization = min(overlap / len(context_words), 1.0) if context_words else 0
-        quality_factors.append(context_utilization * 0.4)
-        
-        # 구체성 (숫자, 날짜, 고유명사 포함 여부)
-        specific_patterns = ["\\d+", "\\d{4}년", "[A-Z][a-z]+"]
+            quality_factors.append(0.2)  # 적당한 답변
+
+        # 2. 질문 관련성 (0.25)
         import re
-        specificity = sum(1 for pattern in specific_patterns if re.search(pattern, answer))
-        quality_factors.append(min(specificity / len(specific_patterns), 1.0) * 0.3)
-        
-        return sum(quality_factors)
+        question_keywords = set(re.findall(r'[가-힣a-zA-Z]+', question.lower()))
+        answer_keywords = set(re.findall(r'[가-힣a-zA-Z]+', answer.lower()))
+
+        if question_keywords:
+            relevance = len(question_keywords.intersection(answer_keywords)) / len(question_keywords)
+            quality_factors.append(relevance * 0.25)
+        else:
+            quality_factors.append(0.15)
+
+        # 3. 컨텍스트 기반 정보 활용도 (0.25)
+        if context and len(context.strip()) > 0:
+            context_keywords = set(re.findall(r'[가-힣a-zA-Z]+', context.lower()))
+            if context_keywords:
+                context_usage = len(context_keywords.intersection(answer_keywords)) / len(context_keywords)
+                quality_factors.append(min(context_usage * 1.5, 0.25))  # 최대 0.25
+            else:
+                quality_factors.append(0.15)
+        else:
+            quality_factors.append(0.1)  # 컨텍스트 없음
+
+        # 4. 한국어 자연스러움 (0.2)
+        korean_patterns = [
+            r'[가-힣]',  # 한글 포함
+            r'입니다|습니다|됩니다',  # 정중한 표현
+            r'[.!?]',  # 적절한 문장부호
+        ]
+        naturalness_score = 0
+        for pattern in korean_patterns:
+            if re.search(pattern, answer):
+                naturalness_score += 1
+        quality_factors.append((naturalness_score / len(korean_patterns)) * 0.2)
+
+        total_score = sum(quality_factors)
+
+        # 최소/최대 값 제한
+        return max(0.1, min(1.0, total_score))
     
     async def _fuse_search_results(
         self, semantic_results: List[Dict[str, Any]], keyword_results: List[Dict[str, Any]]

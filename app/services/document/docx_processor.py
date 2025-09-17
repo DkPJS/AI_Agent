@@ -1,4 +1,4 @@
-from app.processors.base_processor import BaseDocumentProcessor
+from app.services.document.base_processor import BaseDocumentProcessor
 from typing import List
 from docx import Document
 import re

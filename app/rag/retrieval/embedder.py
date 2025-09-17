@@ -26,18 +26,27 @@ class DocumentEmbedder:
         self.tfidf_matrix = None
         self.chunk_contents = []
     def create_embedding(self, text: str) -> List[float]:
-        """텍스트 임베딩 벡터 생성"""
-        embedding_model = get_shared_embedding_model()
-        return embedding_model.create_embedding(text)
-    
+        """텍스트 임베딩 벡터 생성 (캐시 활용)"""
+        from app.rag.retrieval.batch_embedder import get_batch_embedder
+        batch_embedder = get_batch_embedder()
+
+        # 단일 텍스트도 배치 처리를 통해 캐시 활용
+        embeddings = batch_embedder.embed_texts([text], show_progress=False)
+        return embeddings[0] if embeddings else []
+
     def _generate_embedding(self, text: str) -> List[float]:
         """내부 임베딩 생성 메서드 (테스트용)"""
         return self.create_embedding(text)
-    
+
     def create_embeddings_batch(self, texts: List[str], batch_size: int = None) -> List[List[float]]:
-        """배치 텍스트 임베딩 벡터 생성"""
-        embedding_model = get_shared_embedding_model()
-        return embedding_model.create_embeddings_batch(texts, batch_size)
+        """배치 텍스트 임베딩 벡터 생성 (최적화된 버전)"""
+        from app.rag.retrieval.batch_embedder import get_batch_embedder
+        batch_embedder = get_batch_embedder()
+
+        if batch_size:
+            batch_embedder.batch_size = batch_size
+
+        return batch_embedder.embed_texts(texts, show_progress=True)
     
     def store_chunk(self, chunk_id: str, document_id: str, content: str, metadata: Dict[str, Any] = None) -> str:
         """청크 텍스트 임베딩하여 Weaviate에 저장"""
@@ -244,20 +253,51 @@ class DocumentEmbedder:
             return semantic_results
     
 
-    async def search_similar_chunks(self, query: str, limit: int = 5, 
-                                   use_hybrid: bool = True) -> List[Dict[str, Any]]:
-        """향상된 유사 문서 검색 (하이브리드 검색 옵션)"""
+    async def search_similar_chunks(self, query: str, limit: int = 5,
+                                   use_hybrid: bool = True,
+                                   search_strategy: str = "auto",
+                                   filters: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """고급 유사 문서 검색 (메타데이터 인식 하이브리드 검색)"""
         try:
-            logging.info(f"질문 '{query}'에 대한 유사 문서 검색 시작 (하이브리드: {use_hybrid})")
-            
+            logging.info(f"질문 '{query}'에 대한 고급 검색 시작 (전략: {search_strategy})")
+
             if use_hybrid:
-                results = self.hybrid_search(query, limit=limit)
+                # 새로운 고급 하이브리드 검색 사용
+                from app.rag.retrieval.advanced_search import AdvancedHybridSearch
+                advanced_searcher = AdvancedHybridSearch()
+
+                search_results = advanced_searcher.search(
+                    query=query,
+                    limit=limit,
+                    search_strategy=search_strategy,
+                    filters=filters
+                )
+
+                # SearchResult 객체를 Dict로 변환
+                results = []
+                for result in search_results:
+                    results.append({
+                        "content": result.content,
+                        "document_id": result.document_id,
+                        "chunk_id": result.chunk_id,
+                        "relevance": result.relevance_score,
+                        "search_method": result.search_method,
+                        "metadata": result.metadata,
+                        "scores": {
+                            "semantic": result.semantic_score,
+                            "keyword": result.keyword_score,
+                            "structure": result.structure_score,
+                            "recency": result.recency_score,
+                            "popularity": result.popularity_score
+                        }
+                    })
             else:
                 results = self.search_similar(query, limit=limit)
-                
-            logging.info(f"검색 결과: {len(results)} 개의 청크 발견")
+
+            logging.info(f"고급 검색 결과: {len(results)} 개의 청크 발견")
             return results
-            
+
         except Exception as e:
-            logging.error(f"청크 검색 오류: {str(e)}")
-            return []
+            logging.error(f"고급 검색 오류: {str(e)}, 기본 검색으로 fallback")
+            # 기본 검색으로 fallback
+            return self.search_similar(query, limit=limit)

@@ -68,7 +68,7 @@ async def upload_document(
             )
         
         document_id = str(uuid.uuid4())
-        upload_dir = app.config.settings.UPLOAD_DIR
+        upload_dir = config.settings.UPLOAD_DIR
         file_path = os.path.join(upload_dir, f"{document_id}{file_extension}")
         
         # 업로드 디렉토리 확인 및 생성
@@ -385,4 +385,134 @@ async def upload_document(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"문서 처리 중 오류가 발생했습니다: {str(e)}"
+        )
+
+
+@router.post("/upload/fast")
+async def upload_document_fast(
+    file: UploadFile = File(...),
+    description: str = Form(""),
+    db: Session = Depends(get_db)
+):
+    """빠른 문서 업로드 (기능 최소화)"""
+    try:
+        logging.info(f"빠른 업로드 시작: 파일명={file.filename}")
+
+        # 기본 설정 (속도 우선)
+        auto_detect = False  # 동의어 탐지 비활성화
+        do_analyze_structure = False  # 구조 분석 비활성화
+
+        # 1. 파일 검증 및 저장
+        content_type = file.content_type
+        file_extension = os.path.splitext(file.filename)[1].lower()
+
+        supported_extensions = ['.pdf', '.docx', '.xlsx', '.xls', '.hwp', '.txt']
+        if file_extension not in supported_extensions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"지원하지 않는 파일 형식입니다. 지원 형식: {', '.join(supported_extensions)}"
+            )
+
+        document_id = str(uuid.uuid4())
+        upload_dir = config.settings.UPLOAD_DIR
+        file_path = os.path.join(upload_dir, f"{document_id}{file_extension}")
+
+        os.makedirs(upload_dir, exist_ok=True)
+
+        # 파일 저장
+        file_content = await file.read()
+        with open(file_path, "wb") as buffer:
+            buffer.write(file_content)
+
+        logging.info(f"파일 저장 완료: {file_path}")
+
+        # 2. SQL DB에 문서 정보 저장
+        document = Document(
+            id=document_id,
+            filename=file.filename,
+            content_type=content_type,
+            size=len(file_content),
+            description=description or f"{file.filename} (빠른 업로드)"
+        )
+        db.add(document)
+        db.commit()
+        db.refresh(document)
+
+        logging.info(f"문서 정보 저장 완료: {document_id}")
+
+        # 3. 문서 처리 (기본 청킹만)
+        processor = BaseDocumentProcessor.get_processor(file_path)
+        chunks = processor.process(file_path)
+
+        if not chunks:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="문서에서 텍스트를 추출할 수 없습니다."
+            )
+
+        logging.info(f"텍스트 추출 완료: {len(chunks)}개 청크")
+
+        # 4. 청크 저장 (벡터 DB만, Neo4j 건너뛰기)
+        embedder = DocumentEmbedder()
+        db_chunks = []
+
+        for idx, chunk_text in enumerate(chunks):
+            if len(chunk_text.strip()) < 10:
+                continue
+
+            chunk_id = str(uuid.uuid4())
+
+            # SQL DB에 청크 저장
+            chunk = DocumentChunk(
+                id=chunk_id,
+                document_id=document_id,
+                content=chunk_text,
+                chunk_index=idx
+            )
+            db.add(chunk)
+            db_chunks.append(chunk)
+
+            # 벡터 DB 저장 (메타데이터 최소화)
+            metadata = {
+                "filename": document.filename,
+                "chunk_index": idx,
+                "document_type": "일반문서"  # 고정값으로 빠른 처리
+            }
+
+            try:
+                success = embedder.embed_and_store(
+                    text=chunk_text,
+                    metadata=metadata,
+                    chunk_id=chunk_id
+                )
+
+                if not success:
+                    logging.warning(f"청크 {idx} 임베딩 실패, 계속 진행")
+
+            except Exception as embed_error:
+                logging.error(f"청크 {idx} 임베딩 중 오류: {embed_error}")
+                continue
+
+        db.commit()
+
+        response_data = {
+            "message": "문서가 성공적으로 업로드되었습니다 (빠른 모드)",
+            "document_id": document_id,
+            "filename": file.filename,
+            "chunks_count": len(db_chunks),
+            "document_type": "일반문서",
+            "mode": "fast"
+        }
+
+        logging.info(f"빠른 업로드 완료: {document_id}, {len(db_chunks)}개 청크")
+        return response_data
+
+    except HTTPException as e:
+        logging.error(f"빠른 업로드 중 HTTP 오류: {e.detail}")
+        raise e
+    except Exception as e:
+        logging.error(f"빠른 업로드 중 오류 발생: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"빠른 업로드 중 오류가 발생했습니다: {str(e)}"
         )

@@ -52,10 +52,10 @@ class Settings:
     ENABLE_WORD_VECTORS: bool = os.getenv("ENABLE_WORD_VECTORS", "False").lower() in ("true", "1", "t")
     WORD_VECTORS_PATH: str = os.getenv("WORD_VECTORS_PATH", "./static/word_vectors.bin")
     
-    # 임베딩 설정
-    EMBEDDING_BATCH_SIZE: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
-    EMBEDDING_MAX_RETRIES: int = int(os.getenv("EMBEDDING_MAX_RETRIES", "5"))
-    WEAVIATE_STARTUP_PERIOD: int = int(os.getenv("WEAVIATE_STARTUP_PERIOD", "30"))
+    # 임베딩 설정 (성능 최적화)
+    EMBEDDING_BATCH_SIZE: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))  # 배치 크기 증가
+    EMBEDDING_MAX_RETRIES: int = int(os.getenv("EMBEDDING_MAX_RETRIES", "3"))  # 재시도 횟수 감소
+    WEAVIATE_STARTUP_PERIOD: int = int(os.getenv("WEAVIATE_STARTUP_PERIOD", "15"))  # 대기 시간 감소
     
     # 검색 설정 (성능 최적화)
     DEFAULT_SEARCH_LIMIT: int = int(os.getenv("DEFAULT_SEARCH_LIMIT", "3"))  # 5->3로 축소

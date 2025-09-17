@@ -1,4 +1,4 @@
-from app.processors.base_processor import BaseDocumentProcessor
+from app.services.document.base_processor import BaseDocumentProcessor
 from typing import List, Dict, Any
 from pypdf import PdfReader
 try:
@@ -269,12 +269,49 @@ class PDFProcessor(BaseDocumentProcessor):
         # 헤더를 제외한 본문
         content = text[len(page_header):] if page_header else text
         
-        # 본문을 청킹
-        content_chunks = self.chunk_text(content, max_chunk_size - len(page_header), overlap)
-        
+        # 본문을 청킹 (기본 크기 기반 분할)
+        content_chunks = self._basic_text_chunk(content, max_chunk_size - len(page_header), overlap)
+
         # 각 청크에 페이지 헤더 추가
         return [page_header + chunk for chunk in content_chunks if chunk.strip()]
-    
+
+    def _basic_text_chunk(self, text: str, max_chunk_size: int, overlap: int) -> List[str]:
+        """기본 크기 기반 텍스트 청킹 (문자열 반환)"""
+        if not text or len(text) <= max_chunk_size:
+            return [text] if text else []
+
+        chunks = []
+        start = 0
+
+        while start < len(text):
+            end = min(start + max_chunk_size, len(text))
+
+            # 문장이나 단락 경계에서 끊기
+            if end < len(text):
+                # 단락 경계 찾기
+                paragraph_boundary = text.rfind('\n\n', start, end)
+
+                # 문장 경계 찾기
+                sentence_boundary = max(
+                    text.rfind('. ', start, end),
+                    text.rfind('? ', start, end),
+                    text.rfind('! ', start, end)
+                )
+
+                if paragraph_boundary > start + max_chunk_size // 2:
+                    end = paragraph_boundary + 2
+                elif sentence_boundary > start + max_chunk_size // 2:
+                    end = sentence_boundary + 2
+
+            chunk_content = text[start:end].strip()
+            if chunk_content:
+                chunks.append(chunk_content)
+
+            # 다음 시작 위치 (오버랩 고려)
+            start = end - overlap if end < len(text) else len(text)
+
+        return chunks
+
     def _clean_text(self, text: str) -> str:
         """
         추출된 텍스트 정리
